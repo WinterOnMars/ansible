@@ -1,0 +1,87 @@
+---
+# Verify that a systemd service is running and enabled, and that its main
+# process was NOT started with any of the forbidden command-line arguments.
+#
+# Usage:
+#   ansible-playbook -i inventory check_service.yml \
+#     -e target_hosts=webservers -e service_name=myservice
+#
+# The playbook fails for any host where:
+#   - the unit does not exist
+#   - the unit is not running
+#   - the unit is not enabled
+#   - the main process command line contains a forbidden argument
+#     (exact match, e.g. "--parameter1" or "--parameter1=value";
+#      "--parameter10" does NOT match)
+
+- name: Verify systemd service state and command line
+  hosts: "{{ target_hosts | default('all') }}"
+  gather_facts: false
+  become: true            # /proc/<pid>/cmdline can be hidden from non-root (hidepid)
+
+  vars:
+    service_name: myservice     # ".service" suffix optional
+    forbidden_args:
+      - --parameter1
+
+  tasks:
+    - name: Normalise unit name
+      ansible.builtin.set_fact:
+        _unit: "{{ service_name if service_name.endswith('.service') else service_name ~ '.service' }}"
+
+    - name: Gather service facts
+      ansible.builtin.service_facts:
+
+    - name: Pick out facts for the unit
+      ansible.builtin.set_fact:
+        _svc: "{{ ansible_facts.services[_unit] | default({}) }}"
+
+    - name: Fail if service is missing, not running or not enabled
+      ansible.builtin.assert:
+        that:
+          - _svc | length > 0
+          - _svc.state == 'running'
+          - _svc.status == 'enabled'
+        fail_msg: >-
+          {{ _unit }}: exists={{ _svc | length > 0 }},
+          state={{ _svc.state | default('n/a') }},
+          enabled={{ _svc.status | default('n/a') }}
+          (expected state=running, enabled=enabled)
+        success_msg: "{{ _unit }} is running and enabled"
+
+    - name: Get main PID of the service
+      ansible.builtin.command:
+        argv: [systemctl, show, --property=MainPID, --value, "{{ _unit }}"]
+      register: _main_pid
+      changed_when: false
+
+    - name: Fail if service has no main PID
+      ansible.builtin.assert:
+        that: _main_pid.stdout | int > 0
+        fail_msg: "{{ _unit }} reports MainPID={{ _main_pid.stdout }}, cannot inspect its command line"
+        quiet: true
+
+    - name: Read main process command line
+      ansible.builtin.slurp:
+        src: "/proc/{{ _main_pid.stdout | int }}/cmdline"
+      register: _cmdline_raw
+
+    # /proc/<pid>/cmdline is NUL-separated, so splitting on NUL gives the
+    # exact argv list (no ambiguity with spaces inside arguments).
+    - name: Parse command line and look for forbidden arguments
+      ansible.builtin.set_fact:
+        _cmdline_args: "{{ _args }}"
+        _found_forbidden: "{{ _args | select('match', _pattern) | list }}"
+      vars:
+        _args: >-
+          {{ (_cmdline_raw.content | b64decode) | regex_findall('[^\x00]+') }}
+        _pattern: >-
+          ^({{ forbidden_args | map('regex_escape') | join('|') }})(=.*)?$
+
+    - name: Fail if command line contains a forbidden argument
+      ansible.builtin.assert:
+        that: _found_forbidden | length == 0
+        fail_msg: >-
+          {{ _unit }} (PID {{ _main_pid.stdout }}) runs with forbidden argument(s)
+          {{ _found_forbidden | join(', ') }}. Command line: {{ _cmdline_args | join(' ') }}
+        success_msg: "{{ _unit }} command line is clean: {{ _cmdline_args | join(' ') }}"
